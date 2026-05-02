@@ -7,7 +7,7 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -565,22 +565,42 @@ async function handleMessage(
   }
 
   // Check for IM commands (before sanitization — commands are validated individually)
+  // Special-case: `/run <prompt>` is an explicit form of a regular message —
+  // strip the prefix and fall through to the conversation pipeline. Lets users
+  // disambiguate prompts that start with a slash (e.g. asking about a command).
+  let promptText = rawText;
   if (rawText.startsWith('/')) {
-    await handleCommand(adapter, msg, rawText);
-    ack();
-    return;
+    const runMatch = rawText.match(/^\/run(?:@\S+)?(?:\s+([\s\S]*))?$/i);
+    if (runMatch) {
+      const inner = (runMatch[1] ?? '').trim();
+      if (!inner && !hasAttachments) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: 'Usage: /run <prompt>',
+          parseMode: 'plain',
+          replyToMessageId: msg.messageId,
+        });
+        ack();
+        return;
+      }
+      promptText = inner;
+    } else {
+      await handleCommand(adapter, msg, rawText);
+      ack();
+      return;
+    }
   }
 
   // Sanitize general message text before routing to conversation engine
-  const { text, truncated } = sanitizeInput(rawText);
+  const { text, truncated } = sanitizeInput(promptText);
   if (truncated) {
-    console.warn(`[bridge-manager] Input truncated from ${rawText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
+    console.warn(`[bridge-manager] Input truncated from ${promptText.length} to ${text.length} chars for chat ${msg.address.chatId}`);
     store.insertAuditLog({
       channelType: adapter.channelType,
       chatId: msg.address.chatId,
       direction: 'inbound',
       messageId: msg.messageId,
-      summary: `[TRUNCATED] Input truncated from ${rawText.length} chars`,
+      summary: `[TRUNCATED] Input truncated from ${promptText.length} chars`,
     });
   }
 
@@ -820,11 +840,15 @@ async function handleCommand(
         '<b>Commands:</b>',
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
+        '/resume &lt;session_id&gt; [prompt] - Resume a session, optionally with a prompt',
+        '/restart - Restart the session (keeps cwd / mode / model)',
+        '/run &lt;prompt&gt; - Explicit prompt form (useful when text starts with /)',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/model &lt;name&gt; - Override the model for this binding',
         '/status - Show current status',
         '/sessions - List recent sessions',
-        '/stop - Stop current session',
+        '/stop - Stop current task',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
       ].join('\n');
@@ -961,17 +985,118 @@ async function handleCommand(
       break;
     }
 
+    case '/resume': {
+      // Bind this chat to an existing session; optionally fire a prompt right away.
+      // Usage: /resume <session_id> [prompt]
+      const resumeParts = args.split(/\s+/);
+      const resumeId = resumeParts[0];
+      const resumePrompt = resumeParts.slice(1).join(' ').trim();
+      if (!resumeId) {
+        response = 'Usage: /resume &lt;session_id&gt; [prompt]';
+        break;
+      }
+      if (!validateSessionId(resumeId)) {
+        response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
+        break;
+      }
+      const resumed = router.bindToSession(msg.address, resumeId);
+      if (!resumed) {
+        response = 'Session not found.';
+        break;
+      }
+      response = `Resumed session <code>${resumeId.slice(0, 8)}...</code>`;
+      if (resumePrompt) {
+        response += '\nRunning prompt...';
+        // Defer prompt execution: send the bind ack first, then queue the prompt
+        // through the normal session-lock pipeline so it serializes correctly.
+        const synthetic: InboundMessage = { ...msg, text: resumePrompt };
+        queueMicrotask(() => {
+          processWithSessionLock(resumed.codepilotSessionId, () =>
+            handleMessage(adapter, synthetic),
+          ).catch(err => {
+            console.error(`[bridge-manager] /resume prompt failed:`, err);
+          });
+        });
+      }
+      break;
+    }
+
+    case '/model': {
+      // Override the active binding's model. Empty arg clears the override
+      // (binding falls back to session/store/default).
+      if (!args) {
+        response = 'Usage: /model &lt;name&gt;\nExample: /model claude-sonnet-4-7-20260514';
+        break;
+      }
+      // Permissive but sane: model identifiers across providers tend to use
+      // letters, digits, dots, dashes, underscores, slashes, and colons.
+      if (!/^[A-Za-z0-9._:\-/]{1,100}$/.test(args)) {
+        response = 'Invalid model name. Allowed: letters, digits, . _ - / : (max 100 chars).';
+        break;
+      }
+      const modelBinding = router.resolve(msg.address);
+      router.updateBinding(modelBinding.id, { model: args });
+      response = `Model set to <code>${escapeHtml(args)}</code>`;
+      break;
+    }
+
+    case '/restart': {
+      // Drop the current session and create a fresh one in the same chat,
+      // preserving cwd / mode / model overrides. Aborts any running task.
+      const oldRestartBinding = router.resolve(msg.address);
+      const restartState = getState();
+      const oldRestartTask = restartState.activeTasks.get(oldRestartBinding.codepilotSessionId);
+      if (oldRestartTask) {
+        oldRestartTask.abort();
+        restartState.activeTasks.delete(oldRestartBinding.codepilotSessionId);
+      }
+
+      const preservedCwd = oldRestartBinding.workingDirectory || undefined;
+      const newRestartBinding = router.createBinding(msg.address, preservedCwd);
+      const restartUpdates: Partial<Pick<ChannelBinding, 'mode' | 'model'>> = {};
+      if (oldRestartBinding.mode && oldRestartBinding.mode !== 'code') {
+        restartUpdates.mode = oldRestartBinding.mode;
+      }
+      if (oldRestartBinding.model) {
+        restartUpdates.model = oldRestartBinding.model;
+      }
+      if (Object.keys(restartUpdates).length > 0) {
+        router.updateBinding(newRestartBinding.id, restartUpdates);
+      }
+
+      const restartLines = [
+        'Session restarted with fresh context.',
+        `Session: <code>${newRestartBinding.codepilotSessionId.slice(0, 8)}...</code>`,
+        `CWD: <code>${escapeHtml(newRestartBinding.workingDirectory || '~')}</code>`,
+        `Mode: <b>${oldRestartBinding.mode || 'code'}</b>`,
+      ];
+      if (oldRestartBinding.model) {
+        restartLines.push(`Model: <code>${escapeHtml(oldRestartBinding.model)}</code>`);
+      }
+      response = restartLines.join('\n');
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
         '',
+        '<b>Session control:</b>',
         '/new [path] - Start new session',
         '/bind &lt;session_id&gt; - Bind to existing session',
+        '/resume &lt;session_id&gt; [prompt] - Resume a session, optionally with a prompt',
+        '/restart - Restart the session (keeps cwd / mode / model)',
+        '/sessions - List recent sessions',
+        '/stop - Stop current task',
+        '',
+        '<b>Configuration:</b>',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/model &lt;name&gt; - Override the model for this binding',
         '/status - Show current status',
-        '/sessions - List recent sessions',
-        '/stop - Stop current session',
+        '',
+        '<b>Prompts &amp; permissions:</b>',
+        '/run &lt;prompt&gt; - Explicit prompt form (useful when text starts with /)',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
         '/help - Show this help',
@@ -1017,7 +1142,7 @@ export function computeSdkSessionUpdate(
 }
 
 // ── Test-only export ─────────────────────────────────────────
-// Exposed so integration tests can exercise handleMessage directly
-// without wiring up the full adapter loop.
+// Exposed so integration tests can exercise handleMessage / handleCommand
+// directly without wiring up the full adapter loop.
 /** @internal */
-export const _testOnly = { handleMessage };
+export const _testOnly = { handleMessage, handleCommand };
