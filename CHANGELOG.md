@@ -4,16 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [0.3.0] — 2026-05-03
 
-### Added — observability hook (CipherClaw pilot, OTel/Sentry/Langfuse-ready)
+### Added — observability hook (provider-neutral)
 
 A new optional `LifecycleHooks.onTraceEvent` callback emits structured
 `TraceEvent`s at key points in message processing so a host can build per-
 message traces without coupling the bridge to any specific observability
-system. Six event types: `message-start`, `command-dispatch`,
-`llm-stream-start`, `llm-stream-end`, `delivery`, `message-end`. All events
-for one message share `messageId`. Errors thrown from `onTraceEvent` are
-swallowed and logged so observability problems never break the bridge's hot
-path.
+system (OpenTelemetry, Sentry, Langfuse, Datadog, etc.). Six event types:
+`message-start`, `command-dispatch`, `llm-stream-start`, `llm-stream-end`,
+`delivery`, `message-end`. All events for one message share `messageId`.
+Errors thrown from `onTraceEvent` are swallowed and logged so observability
+problems never break the bridge's hot path.
 
 - `src/lib/bridge/host.ts` — `TraceEvent` discriminated union + 6 event
   interfaces; extended `LifecycleHooks` with `onTraceEvent?(event)`.
@@ -25,9 +25,6 @@ path.
   emits `message-start`, `command-dispatch`, `delivery`, `message-end` at
   the right points in `handleMessage()`. Status mapping covers `ok` /
   `error` / `aborted` / `command-only`.
-- `docs/integrations/cipherclaw.md` — new doc with a complete
-  `createCipherClawLifecycle()` adapter (~150 LOC, copy-paste ready) for
-  hosts that want to feed the bridge into CipherClaw.
 
 ### Tests
 

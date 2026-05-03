@@ -164,7 +164,6 @@ You still need to create bots on each platform and obtain tokens:
 | [Security](src/lib/bridge/SECURITY.md) | Threat model, mitigations, deployment recommendations |
 | [Contributing](src/lib/bridge/CONTRIBUTING.md) | Dev setup, code style, testing guide |
 | [Migration](src/lib/bridge/MIGRATION.md) | Before/after import patterns for migrating from direct imports |
-| [CipherClaw integration](docs/integrations/cipherclaw.md) | Pilot adapter wiring bridge `TraceEvent`s into the CipherClaw debug toolkit (causal graphs, drift detection, predictive failure) |
 
 ## Project Structure
 
