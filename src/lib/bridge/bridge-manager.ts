@@ -8,6 +8,7 @@
  */
 
 import type { BridgeStatus, ChannelBinding, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { TraceEvent } from './host.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -191,6 +192,21 @@ function getState(): BridgeManagerState {
     g[GLOBAL_KEY].sessionLocks = new Map();
   }
   return g[GLOBAL_KEY];
+}
+
+/**
+ * Emit a trace event to the host's lifecycle hook.
+ * Errors thrown from the host's onTraceEvent are swallowed and logged so
+ * observability problems never break the bridge's hot path.
+ */
+function emitTrace(event: TraceEvent): void {
+  const lc = getBridgeContext().lifecycle;
+  if (!lc?.onTraceEvent) return;
+  try {
+    lc.onTraceEvent(event);
+  } catch (err) {
+    console.warn('[bridge-manager] onTraceEvent threw:', err instanceof Error ? err.message : err);
+  }
 }
 
 /**
@@ -564,6 +580,25 @@ async function handleMessage(
     }
   }
 
+  // ── Trace: per-message observability ─────────────────────────
+  // Emit `message-start` once per inbound message (after early-return paths
+  // for callbacks / numeric shortcuts / attachment failures). The session ID
+  // may be empty for first-time chats that don't yet have a binding — the
+  // host can use messageId to group spans regardless.
+  const traceStartTs = Date.now();
+  const peekedBinding = store.getChannelBinding(adapter.channelType, msg.address.chatId);
+  const traceSessionIdAtStart = peekedBinding?.codepilotSessionId ?? '';
+  emitTrace({
+    type: 'message-start',
+    ts: traceStartTs,
+    messageId: msg.messageId,
+    sessionId: traceSessionIdAtStart,
+    channelType: adapter.channelType,
+    chatId: msg.address.chatId,
+    hasAttachments: !!hasAttachments,
+    textLength: rawText.length,
+  });
+
   // Check for IM commands (before sanitization — commands are validated individually)
   // Special-case: `/run <prompt>` is an explicit form of a regular message —
   // strip the prefix and fall through to the conversation pipeline. Lets users
@@ -580,12 +615,39 @@ async function handleMessage(
           parseMode: 'plain',
           replyToMessageId: msg.messageId,
         });
+        emitTrace({
+          type: 'message-end',
+          ts: Date.now(),
+          messageId: msg.messageId,
+          sessionId: traceSessionIdAtStart,
+          durationMs: Date.now() - traceStartTs,
+          status: 'command-only',
+        });
         ack();
         return;
       }
       promptText = inner;
     } else {
+      // Trace: command dispatch — extract canonical command name (strip args, @bot suffix)
+      const commandName = rawText.split(/\s+/)[0].split('@')[0].toLowerCase();
+      const hasArgs = rawText.split(/\s+/).length > 1;
+      emitTrace({
+        type: 'command-dispatch',
+        ts: Date.now(),
+        messageId: msg.messageId,
+        sessionId: traceSessionIdAtStart,
+        command: commandName,
+        hasArgs,
+      });
       await handleCommand(adapter, msg, rawText);
+      emitTrace({
+        type: 'message-end',
+        ts: Date.now(),
+        messageId: msg.messageId,
+        sessionId: traceSessionIdAtStart,
+        durationMs: Date.now() - traceStartTs,
+        status: 'command-only',
+      });
       ack();
       return;
     }
@@ -709,6 +771,9 @@ async function handleMessage(
     if (onStreamCardText) onStreamCardText(fullText);
   } : undefined;
 
+  // Hoisted so the `finally` block (trace emission) can see the engine result.
+  let finalResult: engine.ConversationResult | undefined;
+
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
@@ -726,7 +791,8 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, emitTrace, msg.messageId);
+    finalResult = result;
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -745,7 +811,18 @@ async function handleMessage(
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        const delStart = Date.now();
+        const delResult = await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        emitTrace({
+          type: 'delivery',
+          ts: Date.now(),
+          messageId: msg.messageId,
+          sessionId: binding.codepilotSessionId,
+          channelType: adapter.channelType,
+          durationMs: Date.now() - delStart,
+          status: delResult.ok ? 'ok' : 'error',
+          bytesDelivered: result.responseText.length,
+        });
       }
     } else if (result.hasError) {
       const errorResponse: OutboundMessage = {
@@ -754,7 +831,18 @@ async function handleMessage(
         parseMode: 'HTML',
         replyToMessageId: msg.messageId,
       };
-      await deliver(adapter, errorResponse);
+      const delStart = Date.now();
+      const delResult = await deliver(adapter, errorResponse);
+      emitTrace({
+        type: 'delivery',
+        ts: Date.now(),
+        messageId: msg.messageId,
+        sessionId: binding.codepilotSessionId,
+        channelType: adapter.channelType,
+        durationMs: Date.now() - delStart,
+        status: delResult.ok ? 'ok' : 'error',
+        bytesDelivered: errorResponse.text.length,
+      });
     }
 
     // Persist the actual SDK session ID for future resume.
@@ -788,6 +876,23 @@ async function handleMessage(
     state.activeTasks.delete(binding.codepilotSessionId);
     // Notify adapter that message processing ended
     adapter.onMessageEnd?.(msg.address.chatId);
+
+    // Trace: emit message-end. Status reflects what we know about the result.
+    // (`finalResult` may be undefined if engine.processMessage threw before assigning;
+    // in that case we default to 'error'.)
+    const finalStatus: 'ok' | 'error' | 'aborted' =
+      taskAbort.signal.aborted ? 'aborted'
+        : (finalResult && !finalResult.hasError ? 'ok' : 'error');
+    emitTrace({
+      type: 'message-end',
+      ts: Date.now(),
+      messageId: msg.messageId,
+      sessionId: binding.codepilotSessionId,
+      durationMs: Date.now() - traceStartTs,
+      status: finalStatus,
+      errorMessage: finalResult?.hasError ? finalResult.errorMessage : undefined,
+    });
+
     // Commit the offset only after full processing (success or failure)
     ack();
   }

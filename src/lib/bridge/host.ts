@@ -249,4 +249,101 @@ export interface LifecycleHooks {
   onBridgeStart?(): void;
   /** Called when the bridge system stops. */
   onBridgeStop?(): void;
+  /**
+   * Optional observability hook. The bridge emits {@link TraceEvent}s at key
+   * points in message processing (message start/end, command dispatch, LLM
+   * stream start/end, delivery). A host can subscribe to feed these into
+   * CipherClaw, OpenTelemetry, Sentry, Langfuse, Datadog, or any tracing
+   * system without coupling the bridge to a specific provider.
+   *
+   * The bridge swallows any error thrown from this hook so observability
+   * problems never break the message-handling hot path.
+   */
+  onTraceEvent?(event: TraceEvent): void;
+}
+
+// ── Trace Events (observability) ─────────────────────────────
+
+/**
+ * Discriminated union of trace events emitted by the bridge during message
+ * processing. Each event carries the `messageId` and `sessionId` so a host
+ * can group events into a per-message trace tree.
+ *
+ * Event order for a typical inbound message:
+ *   message-start
+ *   ├─ command-dispatch       (only if text starts with `/`, before message-end)
+ *   ├─ llm-stream-start       (only for non-command messages)
+ *   ├─ llm-stream-end
+ *   └─ delivery               (only for non-command messages with output)
+ *   message-end
+ */
+export type TraceEvent =
+  | TraceMessageStartEvent
+  | TraceMessageEndEvent
+  | TraceCommandDispatchEvent
+  | TraceLLMStreamStartEvent
+  | TraceLLMStreamEndEvent
+  | TraceDeliveryEvent;
+
+export interface TraceMessageStartEvent {
+  type: 'message-start';
+  ts: number;             // ms since epoch
+  messageId: string;
+  sessionId: string;      // CodePilot session ID (binding.codepilotSessionId)
+  channelType: string;
+  chatId: string;
+  hasAttachments: boolean;
+  textLength: number;     // length of inbound text (size only, no value)
+}
+
+export interface TraceMessageEndEvent {
+  type: 'message-end';
+  ts: number;
+  messageId: string;
+  sessionId: string;
+  durationMs: number;
+  status: 'ok' | 'error' | 'aborted' | 'command-only';
+  errorMessage?: string;
+}
+
+export interface TraceCommandDispatchEvent {
+  type: 'command-dispatch';
+  ts: number;
+  messageId: string;
+  sessionId: string;
+  command: string;        // e.g. '/help', '/model'
+  hasArgs: boolean;
+}
+
+export interface TraceLLMStreamStartEvent {
+  type: 'llm-stream-start';
+  ts: number;
+  messageId: string;
+  sessionId: string;
+  model?: string;
+  promptLength: number;
+}
+
+export interface TraceLLMStreamEndEvent {
+  type: 'llm-stream-end';
+  ts: number;
+  messageId: string;
+  sessionId: string;
+  durationMs: number;
+  status: 'ok' | 'error';
+  errorMessage?: string;
+  tokenUsage: TokenUsage | null;
+  toolUseCount: number;
+  responseLength: number;
+}
+
+export interface TraceDeliveryEvent {
+  type: 'delivery';
+  ts: number;
+  messageId: string;
+  sessionId: string;
+  channelType: string;
+  durationMs: number;
+  status: 'ok' | 'error';
+  bytesDelivered: number;
 }

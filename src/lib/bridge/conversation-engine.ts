@@ -14,6 +14,7 @@ import type {
   SSEEvent,
   TokenUsage,
   MessageContentBlock,
+  TraceEvent,
 } from './host.js';
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
@@ -45,6 +46,14 @@ export type OnPartialText = (fullText: string) => void;
  */
 export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => void;
 
+/**
+ * Callback for trace events emitted during stream processing.
+ * The bridge-manager wires this up so the host's `onTraceEvent` lifecycle
+ * hook receives `llm-stream-start` / `llm-stream-end` events scoped to this
+ * single message.
+ */
+export type OnTraceEvent = (event: TraceEvent) => void;
+
 export interface ConversationResult {
   responseText: string;
   tokenUsage: TokenUsage | null;
@@ -54,6 +63,8 @@ export interface ConversationResult {
   permissionRequests: PermissionRequestInfo[];
   /** SDK session ID captured from status/result events, for session resume */
   sdkSessionId: string | null;
+  /** Count of tool_use SSE events seen during the stream (for trace metadata) */
+  toolUseCount: number;
 }
 
 /**
@@ -68,9 +79,17 @@ export async function processMessage(
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  onTraceEvent?: OnTraceEvent,
+  traceMessageId?: string,
 ): Promise<ConversationResult> {
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
+  const emitTrace = (event: TraceEvent) => {
+    if (!onTraceEvent) return;
+    try { onTraceEvent(event); } catch (err) {
+      console.warn('[conversation-engine] onTraceEvent threw:', err instanceof Error ? err.message : err);
+    }
+  };
 
   // Acquire session lock
   const lockId = crypto.randomBytes(8).toString('hex');
@@ -83,6 +102,7 @@ export async function processMessage(
       errorMessage: 'Session is busy processing another request',
       permissionRequests: [],
       sdkSessionId: null,
+      toolUseCount: 0,
     };
   }
 
@@ -181,10 +201,41 @@ export async function processMessage(
       },
     });
 
+    // Trace: LLM stream begins.
+    const llmStartTs = Date.now();
+    if (traceMessageId) {
+      emitTrace({
+        type: 'llm-stream-start',
+        ts: llmStartTs,
+        messageId: traceMessageId,
+        sessionId,
+        model: effectiveModel,
+        promptLength: text.length,
+      });
+    }
+
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+    const result = await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+
+    // Trace: LLM stream complete (or errored).
+    if (traceMessageId) {
+      emitTrace({
+        type: 'llm-stream-end',
+        ts: Date.now(),
+        messageId: traceMessageId,
+        sessionId,
+        durationMs: Date.now() - llmStartTs,
+        status: result.hasError ? 'error' : 'ok',
+        errorMessage: result.hasError ? result.errorMessage : undefined,
+        tokenUsage: result.tokenUsage,
+        toolUseCount: result.toolUseCount,
+        responseLength: result.responseText.length,
+      });
+    }
+
+    return result;
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -215,6 +266,7 @@ async function consumeStream(
   const seenToolResultIds = new Set<string>();
   const permissionRequests: PermissionRequestInfo[] = [];
   let capturedSdkSessionId: string | null = null;
+  let toolUseCount = 0;
 
   try {
     while (true) {
@@ -254,6 +306,7 @@ async function consumeStream(
                 name: toolData.name,
                 input: toolData.input,
               });
+              toolUseCount++;
               if (onToolEvent) {
                 try { onToolEvent(toolData.id, toolData.name, 'running'); } catch { /* non-critical */ }
               }
@@ -397,6 +450,7 @@ async function consumeStream(
       errorMessage,
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
+      toolUseCount,
     };
   } catch (e) {
     // Best-effort save on stream error
@@ -429,6 +483,7 @@ async function consumeStream(
       errorMessage: isAbort ? 'Task stopped by user' : (e instanceof Error ? e.message : 'Stream consumption error'),
       permissionRequests,
       sdkSessionId: capturedSdkSessionId,
+      toolUseCount,
     };
   }
 }
