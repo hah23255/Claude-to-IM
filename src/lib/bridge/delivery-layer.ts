@@ -52,10 +52,19 @@ function chunkText(text: string, maxLength: number): string[] {
     }
 
     chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).replace(/^\n/, '');
+    // Strip ALL leading whitespace from the next slice — not only one '\n'.
+    // The previous `replace(/^\n/, '')` only removed a single newline, so when
+    // `splitIdx` landed before a run of blank lines the next chunk would start
+    // with leading whitespace. After markdown → IR → HTML rendering that
+    // whitespace can collapse to an empty payload, which Telegram rejects with
+    // `Bad Request: text must be non-empty`.
+    remaining = remaining.slice(splitIdx).replace(/^\s+/, '');
   }
 
-  return chunks;
+  // Drop any chunks that ended up containing only whitespace (defensive — keeps
+  // downstream code from sending empty payloads regardless of how the splitter
+  // is tuned).
+  return chunks.filter((c) => c.trim().length > 0);
 }
 
 /**

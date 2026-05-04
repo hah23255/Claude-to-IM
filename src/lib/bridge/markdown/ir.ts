@@ -747,9 +747,13 @@ function chunkText(text: string, limit: number): string[] {
     let splitIdx = remaining.lastIndexOf('\n', limit);
     if (splitIdx <= 0 || splitIdx < limit * 0.5) splitIdx = limit;
     chunks.push(remaining.slice(0, splitIdx));
-    remaining = remaining.slice(splitIdx).replace(/^\n/, '');
+    // Strip ALL leading whitespace from the next slice — not only one '\n' —
+    // so chunks downstream don't render to empty payloads at platform send.
+    // See accompanying note in lib/bridge/delivery-layer.ts.
+    remaining = remaining.slice(splitIdx).replace(/^\s+/, '');
   }
-  return chunks;
+  // Drop any all-whitespace chunks defensively.
+  return chunks.filter((c) => c.trim().length > 0);
 }
 
 export function markdownToIR(markdown: string, options: MarkdownParseOptions = {}): MarkdownIR {

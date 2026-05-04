@@ -1,6 +1,6 @@
 {
   "name": "claude-to-im",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Host-agnostic bridge connecting Claude Code SDK to IM platforms (Telegram, Discord, Feishu)",
   "type": "module",
   "main": "dist/lib/bridge/context.js",
