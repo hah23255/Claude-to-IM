@@ -18,6 +18,26 @@ import type {
 import { getBridgeContext } from './context.js';
 import crypto from 'crypto';
 
+/**
+ * Strip vendor metadata suffixes from a model identifier before persisting.
+ *
+ * The Claude Code CLI may emit a model name like `claude-opus-4-7[1m]` on its
+ * `status` SSE event to indicate the 1M-context tier is active. That suffix
+ * is informational, not an accepted `--model` argument — passing it back to
+ * the CLI on the next turn produces "unknown model" and the LLM provider
+ * falls back to the CLI default. Stripping the bracketed suffix at persist
+ * time keeps stored model names round-trippable.
+ *
+ * Examples:
+ *   "claude-opus-4-7[1m]"  → "claude-opus-4-7"
+ *   "claude-sonnet-4-6"    → "claude-sonnet-4-6"   (unchanged)
+ *   "gpt-4o[2024-08-06]"   → "gpt-4o"
+ */
+export function sanitizeModelName(model: string): string {
+  if (typeof model !== 'string') return model;
+  return model.replace(/\[[^\]]*\]\s*$/, '').trim();
+}
+
 export interface PermissionRequestInfo {
   permissionRequestId: string;
   toolName: string;
@@ -321,7 +341,7 @@ async function consumeStream(
                 store.updateSdkSessionId(sessionId, statusData.session_id);
               }
               if (statusData.model) {
-                store.updateSessionModel(sessionId, statusData.model);
+                store.updateSessionModel(sessionId, sanitizeModelName(statusData.model));
               }
             } catch { /* skip */ }
             break;
