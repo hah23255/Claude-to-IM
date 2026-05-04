@@ -253,13 +253,22 @@ function splitMarkdownIRPreserveWhitespace(ir: MarkdownIR, limit: number): Markd
     return [];
   }
   const normalizedLimit = Math.max(1, Math.floor(limit));
-  if (normalizedLimit <= 0 || ir.text.length <= normalizedLimit) {
+  const N = ir.text.length;
+  if (normalizedLimit <= 0 || N <= normalizedLimit) {
     return [ir];
   }
+  // Equal-split: divide into K = ceil(N / limit) chunks of ceil(N / K) chars
+  // each. Avoids the prior fixed-stride approach which left a small remainder
+  // (e.g., splitting 4096 at 441 → 9×441 + 1×127); the 127-char tail then
+  // bypassed the MIN_CHUNK_TEXT_LENGTH floor and surfaced as a tiny Telegram
+  // message. Equal-split keeps every chunk size within `±1` of N/K, so when
+  // the caller's `limit` itself is ≥ MIN we never produce sub-MIN remainders.
+  const K = Math.ceil(N / normalizedLimit);
+  const chunkSize = Math.ceil(N / K);
   const chunks: MarkdownIR[] = [];
   let cursor = 0;
-  while (cursor < ir.text.length) {
-    const end = Math.min(ir.text.length, cursor + normalizedLimit);
+  while (cursor < N) {
+    const end = Math.min(N, cursor + chunkSize);
     chunks.push({
       text: ir.text.slice(cursor, end),
       styles: sliceStyleSpans(ir.styles, cursor, end),
@@ -272,28 +281,51 @@ function splitMarkdownIRPreserveWhitespace(ir: MarkdownIR, limit: number): Markd
 
 // ── Render-first chunking ─────────────────────────────────────
 
+/**
+ * Minimum text length for a single Telegram chunk. Chunks shorter than this
+ * are delivered as-is (potentially with an oversized HTML payload that the
+ * delivery layer's HTML→plain fallback will handle), rather than being split
+ * further. Without this floor, pathological HTML-expansion ratios (e.g.,
+ * heavy nested formatting or many `&` HTML escapes) drove `proportionalLimit`
+ * down to single-digit values, which produced one-character TelegramChunks
+ * and therefore one-letter Telegram messages.
+ *
+ * 256 is a balance: large enough that we never produce visibly-fragmented
+ * messages, small enough that legitimate large-chunk splits still happen.
+ */
+export const MIN_CHUNK_TEXT_LENGTH = 256;
+
 function splitTelegramChunkByHtmlLimit(
   chunk: MarkdownIR,
   htmlLimit: number,
   renderedHtmlLength: number,
 ): MarkdownIR[] {
   const currentTextLength = chunk.text.length;
-  if (currentTextLength <= 1) {
+  // Don't split below 2×MIN. Splitting a chunk that's only slightly larger
+  // than MIN unavoidably leaves a sub-MIN tail (the equal-split picks K=2 and
+  // chunkSize ≈ N/2, both halves below MIN). Returning [chunk] here forces
+  // the outer loop to deliver the chunk as-is (its HTML may exceed limit; the
+  // delivery layer's HTML→plain fallback handles that case).
+  if (currentTextLength <= MIN_CHUNK_TEXT_LENGTH * 2) {
     return [chunk];
   }
   const proportionalLimit = Math.floor(
     (currentTextLength * htmlLimit) / Math.max(renderedHtmlLength, 1),
   );
-  const candidateLimit = Math.min(currentTextLength - 1, proportionalLimit);
+  // splitLimit must be ≥ MIN so that equal-split (above) produces chunks ≥ MIN.
+  const candidateLimit = Math.max(MIN_CHUNK_TEXT_LENGTH, proportionalLimit);
   const splitLimit =
-    Number.isFinite(candidateLimit) && candidateLimit > 0
+    Number.isFinite(candidateLimit) && candidateLimit >= MIN_CHUNK_TEXT_LENGTH
       ? candidateLimit
-      : Math.max(1, Math.floor(currentTextLength / 2));
+      : Math.max(MIN_CHUNK_TEXT_LENGTH, Math.floor(currentTextLength / 2));
   const split = splitMarkdownIRPreserveWhitespace(chunk, splitLimit);
   if (split.length > 1) {
     return split;
   }
-  return splitMarkdownIRPreserveWhitespace(chunk, Math.max(1, Math.floor(currentTextLength / 2)));
+  return splitMarkdownIRPreserveWhitespace(
+    chunk,
+    Math.max(MIN_CHUNK_TEXT_LENGTH, Math.floor(currentTextLength / 2)),
+  );
 }
 
 function renderTelegramChunksWithinHtmlLimit(
@@ -309,7 +341,12 @@ function renderTelegramChunksWithinHtmlLimit(
       continue;
     }
     const html = wrapFileReferencesInHtml(renderTelegramHtml(chunk));
-    if (html.length <= normalizedLimit || chunk.text.length <= 1) {
+    // Accept the chunk as-is if it fits OR if it's at-or-below 2×MIN
+    // (the splitter refuses to split below this threshold to avoid sub-MIN
+    // remainders that surfaced as one-letter Telegram messages). Oversized
+    // HTML on a small-text chunk is handled by the delivery layer's HTML→
+    // plain fallback when Telegram rejects it.
+    if (html.length <= normalizedLimit || chunk.text.length <= MIN_CHUNK_TEXT_LENGTH * 2) {
       rendered.push({ html, text: chunk.text });
       continue;
     }
